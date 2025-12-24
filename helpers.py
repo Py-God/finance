@@ -50,36 +50,33 @@ def login_required(f):
     return decorated_function
 
 
+import yfinance as yf  # <--- Import the new library
+
 def lookup(symbol):
-    """Look up quote for symbol."""
-
-    # Prepare API request
-    symbol = symbol.upper()
-    end = datetime.datetime.now(pytz.timezone("US/Eastern"))
-    start = end - datetime.timedelta(days=7)
-
-    # Yahoo Finance API
-    url = (
-        f"https://query1.finance.yahoo.com/v7/finance/download/{urllib.parse.quote_plus(symbol)}"
-        f"?period1={int(start.timestamp())}"
-        f"&period2={int(end.timestamp())}"
-        f"&interval=1d&events=history&includeAdjustedClose=true"
-    )
-
-    # Query API
+    """Look up quote for symbol using yfinance."""
     try:
-        response = requests.get(
-            url,
-            cookies={"session": str(uuid.uuid4())},
-            headers={"Accept": "*/*", "User-Agent": request.headers.get("User-Agent")},
-        )
-        response.raise_for_status()
+        # Create a Ticker object
+        ticker = yf.Ticker(symbol)
+        
+        # Get the latest day's history
+        # period="1d" fetches the most recent available data
+        data = ticker.history(period="1d")
 
-        # CSV header: Date,Open,High,Low,Close,Adj Close,Volume
-        quotes = list(csv.DictReader(response.content.decode("utf-8").splitlines()))
-        price = round(float(quotes[-1]["Adj Close"]), 2)
-        return {"price": price, "symbol": symbol}
-    except (KeyError, IndexError, requests.RequestException, ValueError):
+        # Check if data exists (if symbol is invalid, dataframe will be empty)
+        if data.empty:
+            return None
+
+        # Extract the closing price from the last row
+        # We use .iloc[-1] to get the last entry (most recent)
+        price = data["Close"].iloc[-1]
+
+        return {
+            "price": price,
+            "symbol": symbol.upper()
+        }
+    except Exception as e:
+        # Print error to console for debugging, but return None to app
+        print(f"Error looking up {symbol}: {e}")
         return None
 
 

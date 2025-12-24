@@ -1,8 +1,8 @@
 import os
 
-from cs50 import SQL
+import sqlite3
 from datetime import datetime
-from flask import Flask, flash, redirect, render_template, request, session
+from flask import Flask, flash, redirect, render_template, request, session, g
 from flask_session import Session
 from werkzeug.security import check_password_hash, generate_password_hash
 
@@ -19,8 +19,47 @@ app.config["SESSION_PERMANENT"] = False
 app.config["SESSION_TYPE"] = "filesystem"
 Session(app)
 
-# Configure CS50 Library to use SQLite database
-db = SQL("sqlite:///finance.db")
+
+# --- NEW DATABASE HELPER FUNCTION ---
+def get_db():
+    """Opens a new database connection if there is none yet for the current application context."""
+    if 'db' not in g:
+        g.db = sqlite3.connect("finance.db")
+        # lets you access columns by name (row['symbol'])
+        g.db.row_factory = sqlite3.Row 
+    return g.db
+
+@app.teardown_appcontext
+def close_db(error):
+    """Closes the database again at the end of the request."""
+    db = g.pop('db', None)
+    if db is not None:
+        db.close()
+
+def query_db(query, args=(), one=False):
+    """
+    A custom wrapper to mimic db.execute.
+    query: The SQL string
+    args: A tuple of arguments to fill the ? placeholders
+    one: If True, returns only the first result.
+    """
+    cur = get_db().execute(query, args)
+    rv = cur.fetchall()
+    cur.close()
+    # Automatically commit changes if it's an INSERT/UPDATE/DELETE
+    get_db().commit() 
+    return (rv[0] if rv else None) if one else rv
+# ----------------------------------------
+
+
+@app.route('/init-db')
+def init_db():
+    with app.app_context():
+        db = get_db()
+        with open('schema.sql', mode='r') as f:
+            db.cursor().executescript(f.read())
+        db.commit()
+    return "Database Initialized!"
 
 
 @app.after_request
@@ -38,7 +77,7 @@ def index():
     """Show portfolio of stocks"""
 
     # get all the transactions made
-    transactions = db.execute("SELECT * FROM transactions WHERE user_id = ?", session["user_id"])
+    transactions = query_db("SELECT * FROM transactions WHERE user_id = ?", (session["user_id"], ))
 
     # get sum total of money spent on stocks
     total = 0
@@ -47,7 +86,7 @@ def index():
         total += sum
 
     # get user balance
-    balance = db.execute("SELECT cash FROM users WHERE id = ?", session["user_id"])
+    balance = query_db("SELECT cash FROM users WHERE id = ?", (session["user_id"],))
 
     # get total balance: user_balance + stock total
     total_balance = balance[0]["cash"] + total
@@ -84,7 +123,7 @@ def buy():
         price = data["price"]
 
         # get how much is in the user's account
-        user_balance = db.execute("SELECT cash FROM users WHERE id = ?", session["user_id"])
+        user_balance = query_db("SELECT cash FROM users WHERE id = ?", (session["user_id"],))
 
         # get current time
         time = datetime.now()
@@ -95,54 +134,40 @@ def buy():
             return apology("Insufficient balance")
 
         # get data from transactions table
-        transactions = db.execute(
-            "SELECT * FROM transactions WHERE user_id = ?", session["user_id"])
+        transactions = query_db(
+            "SELECT * FROM transactions WHERE user_id = ?", (session["user_id"],))
 
         # update the amount of shares i have for that symbol
         for transaction in transactions:
             if transaction["symbol"] == data["symbol"]:
-                db.execute(
+                query_db(
                     "UPDATE transactions SET shares = ? WHERE symbol = ? AND user_id = ?",
                     shares + transaction["shares"],
-                    data["symbol"],
-                    session["user_id"]
+                    (data["symbol"], session["user_id"])
                 )
-                db.execute(
+                query_db(
                     "UPDATE users SET cash = ? WHERE id = ?",
                     user_balance[0]["cash"] - total_amount,
-                    session["user_id"]
+                    (session["user_id"],)
                 )
-
-                db.execute(
+                query_db(
                     "INSERT INTO history (user_id, symbol, shares, price, time) VALUES(?, ?, ?, ?, ?)",
-                    session["user_id"],
-                    data["symbol"],
-                    shares,
-                    price,
-                    time
+                    (session["user_id"], data["symbol"], shares, price, time)
                 )
                 return redirect("/")
 
-        db.execute(
+        query_db(
             "INSERT INTO transactions (user_id, symbol, shares, price, time) VALUES(?, ?, ?, ?, ?)",
-            session["user_id"],
-            data["symbol"],
-            shares,
-            price,
-            time
+            (session["user_id"], data["symbol"], shares, price, time)
         )
-        db.execute(
+        query_db(
             "INSERT INTO history (user_id, symbol, shares, price, time) VALUES(?, ?, ?, ?, ?)",
-            session["user_id"],
-            data["symbol"],
-            shares,
-            price,
-            time
+            (session["user_id"], data["symbol"], shares, price, time)
         )
 
         # reduce user balance
-        db.execute("UPDATE users SET cash = ? WHERE id = ?",
-                   user_balance[0]["cash"] - total_amount, session["user_id"])
+        query_db("UPDATE users SET cash = ? WHERE id = ?",
+                   (user_balance[0]["cash"] - total_amount, session["user_id"]))
 
         return redirect("/")
 
@@ -156,7 +181,7 @@ def history():
     """Show history of transactions"""
 
     # get all the transactions made
-    history = db.execute("SELECT * FROM history WHERE user_id = ?", session["user_id"])
+    history = query_db("SELECT * FROM history WHERE user_id = ?", (session["user_id"],))
 
     return render_template("history.html", history=history)
 
@@ -179,8 +204,8 @@ def login():
             return apology("must provide password", 403)
 
         # Query database for username
-        rows = db.execute(
-            "SELECT * FROM users WHERE username = ?", request.form.get("username")
+        rows = query_db(
+            "SELECT * FROM users WHERE username = ?", (request.form.get("username"),)
         )
 
         # Ensure username exists and password is correct
@@ -260,7 +285,7 @@ def register():
 
         # check if username exists already
         try:
-            db.execute("INSERT INTO users (username, hash) VALUES(?, ?)", username, hash)
+            query_db("INSERT INTO users (username, hash) VALUES(?, ?)", (username, hash))
         except ValueError:
             return apology("Username already exists")
 
@@ -280,8 +305,8 @@ def sell():
     if request.method == "POST":
 
         # get owned stocks
-        transactions = db.execute(
-            "SELECT * FROM transactions WHERE user_id = ?", session["user_id"])
+        transactions = query_db(
+            "SELECT * FROM transactions WHERE user_id = ?", (session["user_id"],))
 
         stocks = [transaction["symbol"] for transaction in transactions]
 
@@ -316,31 +341,31 @@ def sell():
         shares_available = user_shares - shares
 
         # update transactions table to reflect the sale
-        user_balance = db.execute("SELECT cash FROM users WHERE id = ?",
-                                  session["user_id"])[0]["cash"]
+        user_balance = query_db("SELECT cash FROM users WHERE id = ?",
+                                  (session["user_id"],))[0]["cash"]
 
         if shares_available > 0:
-            db.execute("UPDATE transactions SET shares = ? WHERE symbol = ? AND user_id = ?",
-                       shares_available, symbol, session["user_id"])
-            db.execute("UPDATE users SET cash = ? WHERE id = ?", user_balance +
-                       (shares * data["price"]), session["user_id"])
+            query_db("UPDATE transactions SET shares = ? WHERE symbol = ? AND user_id = ?",
+                       (shares_available, symbol, session["user_id"]))
+            query_db("UPDATE users SET cash = ? WHERE id = ?", user_balance +
+                       ((shares * data["price"]), session["user_id"]))
 
-            db.execute("INSERT INTO history (user_id, symbol, shares, price, time) VALUES(?, ?, ?, ?, ?)",
-                       session["user_id"], data["symbol"], shares * -1, data["price"], datetime.now())
+            query_db("INSERT INTO history (user_id, symbol, shares, price, time) VALUES(?, ?, ?, ?, ?)",
+                       (session["user_id"], data["symbol"], shares * -1, data["price"], datetime.now()))
             return redirect("/")
         else:
-            db.execute("DELETE FROM transactions WHERE symbol = ? AND user_id = ?",
-                       symbol, session["user_id"])
-            db.execute("UPDATE users SET cash = ? WHERE id = ?", user_balance +
-                       (shares * data["price"]), session["user_id"])
+            query_db("DELETE FROM transactions WHERE symbol = ? AND user_id = ?",
+                       (symbol, session["user_id"]))
+            query_db("UPDATE users SET cash = ? WHERE id = ?", user_balance +
+                       ((shares * data["price"]), session["user_id"]))
 
-            db.execute("INSERT INTO history (user_id, symbol, shares, price, time) VALUES(?, ?, ?, ?, ?)",
-                       session["user_id"], data["symbol"], shares * -1, data["price"], datetime.now())
+            query_db("INSERT INTO history (user_id, symbol, shares, price, time) VALUES(?, ?, ?, ?, ?)",
+                       (session["user_id"], data["symbol"], shares * -1, data["price"], datetime.now()))
             return redirect("/")
     else:
         # get transactions data
-        transactions = db.execute(
-            "SELECT * FROM transactions WHERE user_id = ?", session["user_id"])
+        transactions = query_db(
+            "SELECT * FROM transactions WHERE user_id = ?", (session["user_id"],))
         return render_template("sell.html", transactions=transactions)
 
 
@@ -354,7 +379,7 @@ def change_password():
         if not username:
             return apology("Invalid username.")
 
-        name = db.execute("SELECT username FROM users WHERE username = ?", username)
+        name = query_db("SELECT username FROM users WHERE username = ?", (username,))
         if not name:
             return apology("Username does not exist")
         if username != name[0]["username"]:
@@ -364,7 +389,7 @@ def change_password():
             return apology("You did not provide a password")
 
         new_password_hash = generate_password_hash(new, method="scrypt", salt_length=16)
-        db.execute("UPDATE users SET hash = ? WHERE username = ?", new_password_hash, username)
+        query_db("UPDATE users SET hash = ? WHERE username = ?", (new_password_hash, username))
         return redirect("/login")
 
     else:
